@@ -1,0 +1,478 @@
+---
+title: "Data Wrangling Final Project"
+author: "Weikai Mao"
+date: "April 22, 2019"
+output:
+  html_document: default
+---
+
+Github: https://github.com/WalkerMao/Data-Wrangling-final-project
+
+In this data set, there are sales prices and another 79 explanatory variables describing almost every aspect of residential homes, including housing structure and decoration condition, surrounding facilities of housing, and several indices indicating real estate market. I used these variables to predict the sales prices.
+
+In this data set, each house has a unique id and every house is described in 79 predictor variables such as MSSubClass (The building class), Street (Type of road access), YearBuilt (Original construction date), etc. The response variable is SalePrice, depicting the property's sale price in dollars, which is the target variable that I tried to predict. 
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE)
+```
+
+```{r import packages, message=FALSE, warning=FALSE}
+library(tidyverse)
+library(formattable)
+library(gridExtra)
+library(moments) # for skewness() func
+library(corrplot)
+library(glmnet)
+```
+
+## Data exploration and transformation
+
+### Overview of the data
+
+#### Read the data
+
+Delete the column `Id` since We do not need this feature. Divide this training data into `xtr` and `ytr`.
+
+```{r read the data, message=FALSE}
+train = read_csv('../data/train.csv') %>% dplyr::select(-'Id') # delete the column id that we do not need
+xtr = train %>% dplyr::select(-'SalePrice')
+ytr = train %>% dplyr::select('SalePrice')
+xte = read_csv('../data/test.csv') %>% dplyr::select(-'Id')
+xall = rbind(xtr, xte)
+```
+
+#### Dimension
+
+```{r Dimension}
+sprintf("There are %d training samples and %d explanatory features.", dim(xtr)[1], dim(xtr)[2])
+```
+
+#### Types of explanatory variables
+
+```{r Types}
+table(sapply(xtr, class))
+```
+
+### Missing data processing
+
+There are many `NA` in this data set. The plot below shows the proporation of the `NA` for each variables that have `NA`.
+
+```{r}
+
+miss = xall %>% 
+  sapply(is.na) %>% 
+  colSums() %>% 
+  sort(decreasing = TRUE)
+
+miss = (miss[miss > 0] / dim(xall)[1]) %>% stack()
+miss$values = percent(miss$values)
+colnames(miss) = c('Proportion of NA', 'Variables')
+
+miss %>% 
+  ggplot(data=., aes(y=`Proportion of NA`, x=`Variables`)) + 
+  geom_bar(stat="identity") +
+  coord_flip()
+
+```
+
+However, most of them are meaningful but not missing data. For exmaple, the `NA` in the variables of `BsmtQual`, `BsmtCond`, `GarageQual`, `GarageCond` mean that this house do not have a basement or a garage. 
+
+After reading the data description, I fill in these meaningful `NA` with 'None'. For the missing data, I fill in the `NA` of numerical variables with median value, and fill in the `NA` of categorical variables with mode value.
+
+```{r}
+
+# fill in NA with median value
+xall$LotFrontage[is.na(xall$LotFrontage)] = median(xall$LotFrontage, na.rm = TRUE) 
+
+# fill in NA with mode value 
+getmode <- function(x) {
+  ux <- unique(x)
+  ux[which.max(tabulate(match(x, ux)))]
+}
+
+fill_mode_var = c('MSZoning', 'Utilities', 'Functional', 'Electrical', 'KitchenQual', 'Exterior1st', 'Exterior2nd', 'SaleType')
+
+for (v in fill_mode_var){
+  xall[v][is.na(xall[v])] = getmode(na.omit(xall[v][[1]]))
+}
+
+# fill in NA with 'None'
+fill_none_var = c('PoolQC', 'MiscFeature','Alley', 'Fence', 'FireplaceQu', 'GarageType', 'GarageFinish', 'GarageQual', 'GarageCond', 'GarageYrBlt', 'GarageArea', 'GarageCars', 'BsmtFinSF1', 'BsmtFinSF2', 'BsmtUnfSF','TotalBsmtSF', 'BsmtFullBath', 'BsmtHalfBath', 'BsmtQual', 'BsmtCond', 'BsmtExposure', 'BsmtFinType1', 'BsmtFinType2', 'MasVnrType', 'MasVnrArea')
+
+for (v in fill_none_var){
+  xall[v][is.na(xall[v])] = 'None'
+}
+
+```
+
+### Label encoding
+
+Some categorical variables may have numerical order, which means they should be ordinal variables. I encode labels for these variables. For example, 'Ex'(excellent)=5, 'Gd'(good)=4, 'TA'(typical)=3, 'Fa'(fair)=2, 'Po'(poor)=1, 'None'=0. 
+
+```{r warning=FALSE}
+
+mapping = c('Ex'=5,'Gd'=4,'TA'=3,'Fa'=2,'Po'=1,'None'=0)
+ordinal_var = c('BsmtQual', 'BsmtCond', 'GarageQual', 'GarageCond', 'ExterQual', 'ExterCond', 'HeatingQC', 'PoolQC', 'KitchenQual')
+
+for (v in ordinal_var){
+  xall[v] = c('Ex'=5,'Gd'=4,'TA'=3,'Fa'=2,'Po'=1,'None'=0)[xall[v][[1]]]
+}
+xall['BsmtFinType1'] = c('GLQ'=6,'ALQ'=5,'BLQ'=4,'Rec'=3,'LwQ'=2,'Unf'=1,'None'=0)[xall['BsmtFinType1'][[1]]]
+xall['BsmtFinType2'] = c('GLQ'=6,'ALQ'=5,'BLQ'=4,'Rec'=3,'LwQ'=2,'Unf'=1,'None'=0)[xall['BsmtFinType2'][[1]]]
+xall['Functional'] = c('Typ'=7,'Min1'=6,'Min2'=5,'Mod'=4,'Maj1'=3,'Maj2'=2,'Sev'=1,'Sal'=0)[xall['Functional'][[1]]]
+xall['Fence'] = c('GdPrv'=4,'MnPrv'=3,'GdWo'=2,'MnWw'=1,'None'=0)[xall['Fence'][[1]]]
+xall['BsmtExposure'] = c('Gd'=4,'Av'=3,'Mn'=2,'No'=1,'None'=0)[xall['BsmtExposure'][[1]]]
+xall['GarageFinish'] = c('None'=0, 'Unf'=1, 'RFn'=2, 'Fin'=3)[xall['GarageFinish'][[1]]]
+xall['LandSlope'] = c('Sev'=1, 'Mod'=2, 'Gtl'=3)[xall['LandSlope'][[1]]]
+xall['LotShape'] = c('IR3'=1, 'IR2'=2, 'IR1'=3, 'Reg'=4)[xall['LotShape'][[1]]]
+xall['PavedDrive'] = c('N'=1, 'P'=2, 'Y'=3)[xall['PavedDrive'][[1]]]
+xall['Street'] = c('Grvl'=1, 'Pave'=2)[xall['Street'][[1]]]
+xall['Alley'] = c('None'=0, 'Grvl'=1, 'Pave'=2)[xall['Alley'][[1]]]
+xall['CentralAir'] = c('N'=0, 'Y'=1)[xall['CentralAir'][[1]]]
+
+xall[xall == 'None'] = 0
+
+for (v in colnames(xall)){
+  x = xall[v][[1]]
+  xall[v] = ifelse(is.na(as.numeric(x)), x, as.numeric(x))
+}
+
+```
+
+### Log transformation of target variable (SalePrice)
+
+The target variable is `SalePrice`, which is a numerical variable. The 2 plots in the left part below are the density distribution and QQ plot for original `SalePrice`. We can observe that it is kind of like skew normal distribution. 
+
+Let us try log-transformation to reduce the skewness. The 2 plots in the right part below are the density distribution and QQ plot for `log(1+SalePrice)`. It is much better after log-transformation, with respect to the skewness and QQ plot. 
+
+```{r Log transformation, fig.height=10, fig.width=10}
+ytr_list = as.list(ytr)$SalePrice
+
+# for distribution plot
+dist = function(li){
+  ggplot(li) + 
+  geom_histogram(aes(x=li[[1]], y=..density..), position="identity", bins = 100) + 
+  geom_density(aes(x=li[[1]], y=..density..), size = 1)
+}
+
+# for QQ plot
+qq = function(li){
+  ggplot() + 
+  aes(sample = li) + 
+  geom_qq(distribution = qnorm) + 
+  geom_qq_line(col = "red")
+}
+
+dist_ytr = dist(ytr) + 
+  ggtitle("Original distribution of SalePrice") + 
+  xlab(paste('SalePrice', '\n', 'Skewness:', round(skewness(ytr)[[1]], 4)))
+
+dist_log_ytr = dist(log(ytr)) + 
+  ggtitle("After log transformation") + 
+  xlab(paste('log(SalePrice)', '\n', 'Skewness:', round(skewness(log(ytr))[[1]], 4)))
+
+qq_ytr = qq(ytr_list) + ggtitle("QQ plot for original SalePrice")
+qq_log_ytr = qq(log(ytr_list)) + ggtitle("After log transformation")
+
+grid.arrange(dist_ytr, dist_log_ytr, qq_ytr, qq_log_ytr, ncol=2)
+
+log1p_ytr = log(1 + ytr)
+colnames(log1p_ytr) = 'log1p_SalePrice'
+```
+
+### Box-Cox transformation
+
+There are many variables that are highly skewed. I used the Box-Cox transformation to reduce the skewness. 
+
+$$
+{ x }_{ \lambda  }^{ ' }  =  \frac { { x }^{ \lambda  } - 1 }{ \lambda  }, when \ \lambda \neq 0. 
+$$
+$$
+{ x }_{ \lambda  }^{ ' }  =  log(x), when \ \lambda = 0. 
+$$
+
+I use for-loops to search the parameter $\lambda$, and save the data to csv file before and after the Box-Cox transformation. 
+
+```{r Box-Cox}
+
+num_names = colnames(xall)[sapply(xall, class) == "numeric"]
+
+write_csv(xall, '../data/xall_before_boxcox.csv')
+
+for (v in num_names){
+  # box-cox need all of the values to be positive
+  xall[v] = xall[v] - min(xall[v]) + 1 # plus the minimun and 1 to prepare for the box-cox
+  # search for the best lambda for the box-cox
+  low = -2
+  up = 2
+  for (i in 1:5){
+    bc = MASS::boxcox(xall[v][[1]] ~ 1, lambda=seq(low, up, len=(up-low)*100+1), plotit=FALSE)
+    best_lambda = bc$x[which(bc$y == max(bc$y))]
+    if (best_lambda == up){
+      low = best_lambda - 0.01
+      up = 2*up
+    }
+    else if(best_lambda == low){
+      up = best_lambda + 0.01
+      low = 2*low
+    }
+    else{break}
+    # if (i > 3){print(v)}
+  }
+  # box-cox transformation
+  xall[v] = (xall[v] ^ best_lambda - 1) / best_lambda 
+}
+
+write_csv(xall, '../data/xall_after_boxcox.csv')
+```
+
+The plots below are the density distribution of numerical variables. The previous plot is the data before box-cox transformation, and the latter one is the data after box-cox transformation.  
+
+**The darker plots refer to the higher skewness.** We can see that the latter plot (after box-cox) are lighter than the previous one (before box-cox), which means the box-cox transformation significantly reduce the skewness of these numerical variables.
+
+```{r density, fig.height=25, fig.width=15, message=FALSE, warning=FALSE}
+# xall = xall_before_boxcox
+den_skew_plots = function(xall){
+  num_names = colnames(xall)[sapply(xall, class) == "numeric"]
+  p_li = list()
+  
+  for (num_var in num_names){
+    data = xall[, num_var]
+    colnames(data) = 'temp_name'
+    grey_degree = 100 - as.integer(min(60, 10*(abs(skewness(data)))))
+        
+    p = ggplot(data = data, aes(x = `temp_name`)) + 
+      geom_line(stat = 'density', size=1) +
+      xlab(paste(num_var, '\n', 'Skew:', round(skewness(data)[[1]], 4))) + 
+      theme(panel.background = element_rect(fill = paste0('grey', grey_degree)))
+    
+    p_li = c(p_li, list(p))
+  }
+  do.call("grid.arrange", c(p_li, ncol=6))
+}
+
+xall_before_boxcox = read_csv('../data/xall_before_boxcox.csv')
+print('Density distribution before Box-Cox transformation: ')
+den_skew_plots(xall_before_boxcox)
+
+xall_after_boxcox = read_csv('../data/xall_after_boxcox.csv')
+print('After Box-Cox transformation: ')
+den_skew_plots(xall_after_boxcox)
+
+```
+
+### Get the dummy variables
+
+There are some categorical variables that do not have numerical order, we cannot transform them to ordinal variables. I converted them to dummy variables. 
+
+After these data transformations, all of the data are in the numerical format.
+
+```{r dummy variables}
+# dummy variables
+xall = xall %>% 
+  as.data.frame() %>% 
+  fastDummies::dummy_cols() %>% 
+  .[colnames(.)[sapply(., class) != "character"]]
+```
+
+### Standardize data to standard Score (Z score)
+
+Different variables have different scales, which may have impacts on our models. 
+
+As for regularized linear regression, we need to penalize the size of the coefficients, which will be affected by the different scales of variables. So it is necessary to standardize the variables to eliminate the influence of the different scales.
+
+I centered the data and changed the units to standard deviations by subtracting mean and dividing by standard deviation.
+
+$$
+x_i^* = \frac {x_i - mean(x)} {sd(x)}
+$$
+
+```{r Standardize}
+for (v in colnames(xall)){
+  xall[v] = (xall[v] - mean(xall[v][[1]])) / sd(xall[v][[1]]) 
+}
+```
+
+### Save the transformed data
+
+All of the transformations are done. Now I save the data to csv file. 
+
+```{r save}
+xall[1:nrow(xtr), ] %>% 
+  cbind(log1p_ytr) %>% 
+  write_csv('../data/train_after_transformation.csv')
+
+write_csv(xall[nrow(xtr)+1 : nrow(xall), ], '../data/x_test_after_transformation.csv')
+
+sprintf('After data transformation, there are %d explanatory variables.', dim(xall)[2])
+
+```
+
+
+### Correlation matrix
+
+Correlation is a significant measurement for the importance of variables. The variables in the plot blow are ordered by its absolute value of correlation with the response variable `log1p_SalePrice`. Since there are too many variables, I select out the variables whose absolute value of correlation with `log1p_SalePrice` are greater than 0.5.
+
+We can notice that the variable `OverallQual`(overall quality) has the highest correlation with `log1p_SalePrice`, which means it is highly positive correlated with our target variable. 
+
+```{r Correlation matrix, fig.height=15, fig.width=15, message=FALSE, warning=FALSE}
+
+xtr = read_csv('../data/train_after_transformation.csv') %>% dplyr::select(-'log1p_SalePrice')
+ytr = read_csv('../data/train_after_transformation.csv') %>% dplyr::select('log1p_SalePrice')
+
+cor_numVar = cor(cbind(xtr, ytr), use="pairwise.complete.obs") # correlations of all numeric variables
+# sort on decreasing correlations with log1p_SalePrice      
+cor_sorted = as.matrix(sort(cor_numVar[, 'log1p_SalePrice'], decreasing = TRUE))
+  
+# select only high corelations
+CorHigh = names(which(apply(cor_sorted, 1, function(x) abs(x)>0.5)))
+cor_numVar = cor_numVar[CorHigh, CorHigh]
+
+corrplot.mixed(cor_numVar, tl.col="black", tl.pos = "lt")
+
+print('====== High influential variables: =======')
+print(CorHigh)
+
+```
+
+### Regression plots for important variables
+
+For the plots below, I use the top 12 influential variables according to their correlation with `log1p_SalePrice`.
+
+The formula on the top of each plot is the simple linear regression fit model and its corresponding R-square. The skyblue points are the scatter plots. The blue lines are the simple linear regression fit lines. The tan lines are the smooth curve fitted by Loess.
+
+```{r fig.height=7, fig.width=10, warning=FALSE}
+
+lm_eqn <- function(data){
+    m <- lm(data[,2] ~ data[,1], data);
+    eq <- substitute(italic(y) == a + b %.% italic(x)*","~~italic(R)^2~"="~r2, 
+         list(a = as.numeric(format(coef(m)[1], digits = 2)),
+              b = as.numeric(format(coef(m)[2], digits = 2)),
+             r2 = format(summary(m)$r.squared, digits = 4)))
+    as.character(as.expression(eq));
+}
+
+# CorHigh = c("log1p_SalePrice","OverallQual", "GrLivArea" )
+
+reg_plot = function(i){
+  data = cbind(xtr[CorHigh[i]], ytr)
+  p = ggplot(data = data, aes(x=data[,1], y=data[,2])) +
+    geom_point(color = 'skyblue') +
+    geom_smooth(method=loess, fill="tan1", color="tan2") +
+    geom_smooth(method=lm, fill="blue", color="blue") + 
+    xlab(CorHigh[i]) + ylab("log(1+SalePrice)") +
+    annotate("text", x = -Inf, y = Inf, label = lm_eqn(data = data), hjust = 0, vjust = 1, parse = TRUE)
+  
+  return(p)
+  # p_li[[i-1]] = p
+  # p_li = c(p_li, list(p))
+}
+
+# do.call("grid.arrange", c(p_li, ncol=2))
+
+p2 = reg_plot(2)
+p3 = reg_plot(3)
+p4 = reg_plot(4)
+p5 = reg_plot(5)
+p6 = reg_plot(6)
+p7 = reg_plot(7)
+p8 = reg_plot(8)
+p9 = reg_plot(9)
+p10 = reg_plot(10)
+p11 = reg_plot(11)
+p12 = reg_plot(12)
+p13 = reg_plot(13)
+
+grid.arrange(p2,p3,p4,p5,p6,p7, ncol=3)
+grid.arrange(p8,p9,p10,p11,p12,p13, ncol=3)
+
+```
+
+## Modeling
+
+Since there are too many explanatory variables, we should use regularized linear regression model. We use cross valiation to select the best parameter $\lambda$.
+
+### LASSO
+
+```{r build LASSO}
+ytr_li = ytr[[1]]
+xtr_mt = as.matrix(xtr)
+
+cv.lasso = cv.glmnet(xtr_mt, ytr_li, alpha = 1, family="gaussian")
+plot(cv.lasso)
+sprintf('Best lambda for LASSO: %f.', cv.lasso$lambda.min)
+
+coef_lasso = coef(cv.lasso, cv.lasso$lambda.min) %>% 
+  as.matrix() %>% 
+  as.data.frame()
+coef_lasso$abs = abs(coef_lasso[,1])
+
+print('====== Variables with top 20 largest absolute value of coeficients. ======')
+coef_lasso$abs %>% 
+  order(coef_lasso$abs, decreasing = TRUE) %>% 
+  coef_lasso[., ] %>% 
+  head(20) %>% 
+  dplyr::select(-'abs')
+
+```
+
+```{r test LASSO, message=FALSE}
+xte_mt = read_csv('../data/x_test_after_transformation.csv') %>% as.matrix()
+
+# Final model with lambda.min
+lasso.model = glmnet(xtr_mt, ytr_li, alpha = 1, family = "gaussian", lambda = cv.lasso$lambda.min)
+# Make predictions on training data
+lasso_pre_tr = lasso.model %>% predict(newx = xtr_mt)
+sprintf('Training RMSE of LASSO: %f.', sqrt(mean((ytr_li - lasso_pre_tr)^2))) # training RMSE
+# Make predictions on test data
+lasso_pre_te = lasso.model %>% predict(newx = xte_mt)
+write.csv((exp(lasso_pre_te)-1), '../data/lasso_pre_te.csv')
+# test RMSE 0.12575
+```
+
+The test RMSE of LASSO: 0.12575.
+
+### Ridge regression
+
+```{r build ridge regression}
+ytr_li = ytr[[1]]
+xtr_mt = as.matrix(xtr)
+
+cv.ridge = cv.glmnet(xtr_mt, ytr_li, alpha = 0, family="gaussian")
+plot(cv.ridge)
+sprintf('Best lambda for ridge regression: %f.', cv.ridge$lambda.min)
+coef_ridge = coef(cv.ridge, cv.ridge$lambda.min) %>% 
+  as.matrix() %>% 
+  as.data.frame()
+coef_ridge$abs = abs(coef_ridge[,1])
+
+print('====== Variables with top 20 largest absolute value of coeficients. ======')
+coef_ridge$abs %>% 
+  order(coef_ridge$abs, decreasing = TRUE) %>% 
+  coef_ridge[., ] %>% 
+  head(20) %>% 
+  dplyr::select(-'abs')
+
+```
+
+```{r test ridge regression, message=FALSE}
+xte_mt = read_csv('../data/x_test_after_transformation.csv') %>% as.matrix()
+
+# Final model with lambda.min
+ridge.model = glmnet(xtr_mt, ytr_li, alpha = 0, family = "gaussian", lambda = cv.ridge$lambda.min)
+# Make predictions on training data
+ridge_pre_tr = ridge.model %>% predict(newx = xtr_mt)
+sprintf('Training RMSE of ridge regression: %f.', sqrt(mean((ytr_li - ridge_pre_tr)^2))) # training RMSE
+# Make predictions on test data
+ridge_pre_te = ridge.model %>% predict(newx = xte_mt)
+write.csv((exp(ridge_pre_te)-1), '../data/ridge_pre_te.csv')
+# test RMSE 0.13306
+```
+
+The test RMSE of ridge regression 0.13306.
+
+### Summary
+
+From the test RMSE, we can conclude that LASSO is better than ridge regression for this problem. 
+
+From the coeficients of both two reguralized linear regression models, the variables `GrLivArea`, `OverallQual`, `1stFlrSF`, `TotalBsmtSF`, `OverallCond` and `LotArea` have signigiantly positive influence of response variable `SalePrice`. The variables `MSZoning_C (all)` and `RoofMatl_ClyTile` have signigiantly negative influence.
